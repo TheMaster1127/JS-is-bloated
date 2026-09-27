@@ -1,0 +1,17 @@
+# Compiled binaries
+hello
+mega
+a.out
+*.o
+*.a
+*.s
+
+# Build directories
+.scriptc/
+.jsib_build/
+.cache/
+
+# Editor / OS files
+*~
+*.swp
+.DS_Store

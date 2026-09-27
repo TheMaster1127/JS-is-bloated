@@ -1,0 +1,362 @@
+#!/bin/bash
+# jsib — JS Is Bloated? Not anymore.
+# Turns JavaScript/TypeScript into sub-100KB standalone static Linux ELF binaries.
+# Full runtime support: async/await, fibers, fs, child_process, regex, zlib, TLS/fetch.
+# Powered by scriptc + musl + GNU ld dead-code elimination.
+
+set -e
+
+if [ "$(uname -s)" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
+    echo "❌ jsib currently only supports x86_64 Linux."
+    exit 1
+fi
+
+show_usage() {
+    echo "jsib — JS Is Bloated? Not anymore."
+    echo ""
+    echo "Usage:"
+    echo "  jsib <file.js|file.ts> [options]"
+    echo "  jsib -c                          # (re)build full cache only"
+    echo ""
+    echo "Options:"
+    echo "  -o <name>         Output binary name (default: basename without .js/.ts)"
+    echo "  -c, --recache     Force rebuild the static runtime cache"
+    echo "  -k, --keep        Keep temporary C/ASM/LD artifacts"
+    echo "  -h, --help        Show this help"
+    exit 0
+}
+
+INPUT=""
+OUTPUT=""
+KEEP=0
+FORCE_RECACHE=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o)
+            shift
+            OUTPUT="$1"
+            ;;
+        -c|--recache)
+            FORCE_RECACHE=1
+            ;;
+        -k|--keep)
+            KEEP=1
+            ;;
+        -h|--help)
+            show_usage
+            ;;
+        -*)
+            echo "❌ Unknown option: $1"
+            show_usage
+            ;;
+        *)
+            if [ -z "$INPUT" ]; then
+                INPUT="$1"
+            else
+                echo "❌ Multiple input files specified."
+                exit 1
+            fi
+            ;;
+    esac
+    shift
+done
+
+if [ -z "$INPUT" ] && [ "$FORCE_RECACHE" -eq 0 ]; then
+    show_usage
+fi
+
+if [ -n "$INPUT" ] && [ ! -f "$INPUT" ]; then
+    echo "❌ Input file not found: $INPUT"
+    exit 1
+fi
+
+for cmd in scriptc gcc as ld; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "❌ Missing required tool: $cmd"
+        exit 1
+    fi
+done
+
+MUSL_PATH="/usr/lib/musl"
+[ ! -d "$MUSL_PATH" ] && [ -d "/usr/local/musl" ] && MUSL_PATH="/usr/local/musl"
+
+if [ ! -f "$MUSL_PATH/lib/libc.a" ] || [ ! -f "$MUSL_PATH/lib/crt1.o" ]; then
+    echo "❌ Musl libc not found in $MUSL_PATH"
+    exit 1
+fi
+
+RUNTIME_DIR=""
+for p in \
+    "$(npm root -g 2>/dev/null)/scriptc/node_modules/@scriptc/runtime/src" \
+    "$HOME/.npm-global/lib/node_modules/scriptc/node_modules/@scriptc/runtime/src" \
+    "/usr/lib/node_modules/scriptc/node_modules/@scriptc/runtime/src" \
+    "/usr/local/lib/node_modules/scriptc/node_modules/@scriptc/runtime/src"; do
+    if [ -d "$p" ]; then
+        RUNTIME_DIR="$p"
+        break
+    fi
+done
+
+if [ -z "$RUNTIME_DIR" ]; then
+    echo "❌ Could not locate @scriptc/runtime/src"
+    exit 1
+fi
+
+VENDOR_DIR="$(dirname "$RUNTIME_DIR")/vendor"
+
+# Clean Pre-flight Permission Check (Zero Sudo Escalation)
+if [ -d "$VENDOR_DIR" ] && [ ! -w "$VENDOR_DIR" ]; then
+    echo "❌ Error: scriptc vendor directory is read-only:"
+    echo "   $VENDOR_DIR"
+    echo ""
+    echo "   scriptc compiles internal vendor caches on-demand and requires write access."
+    echo "   To fix this without running jsib as root, choose one option:"
+    echo "     1. User-owned npm (Best):  npm config set prefix '~/.npm-global' && npm i -g scriptc"
+    echo "     2. Reclaim ownership:      sudo chown -R \$USER:\$USER \"$(dirname "$RUNTIME_DIR")\""
+    exit 1
+fi
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/jsib"
+STATIC_LIB="$CACHE_DIR/libscruntime.a"
+LINK_SCRIPT="$CACHE_DIR/link.ld"
+
+rebuild_cache() {
+    echo "⚙️  [Cache] Building FULL static runtime cache (Regex, zlib & mbedTLS)..."
+    mkdir -p "$CACHE_DIR"
+    local TMP_DIR
+    TMP_DIR="$(mktemp -d /tmp/jsib_cache_XXXXXX)"
+
+    printf '%s\n' \
+    '.text' \
+    '.global getcontext' \
+    'getcontext:' \
+    '    movq %rbx, 128(%rdi)' \
+    '    movq %rbp, 120(%rdi)' \
+    '    movq %r12, 72(%rdi)' \
+    '    movq %r13, 80(%rdi)' \
+    '    movq %r14, 88(%rdi)' \
+    '    movq %r15, 96(%rdi)' \
+    '    movq (%rsp), %rax' \
+    '    movq %rax, 168(%rdi)' \
+    '    leaq 8(%rsp), %rax' \
+    '    movq %rax, 160(%rdi)' \
+    '    xorl %eax, %eax' \
+    '    ret' \
+    '.global setcontext' \
+    'setcontext:' \
+    '    movq 128(%rdi), %rbx' \
+    '    movq 120(%rdi), %rbp' \
+    '    movq 72(%rdi), %r12' \
+    '    movq 80(%rdi), %r13' \
+    '    movq 88(%rdi), %r14' \
+    '    movq 96(%rdi), %r15' \
+    '    movq 40(%rdi), %r8' \
+    '    movq 48(%rdi), %r9' \
+    '    movq 136(%rdi), %rdx' \
+    '    movq 152(%rdi), %rcx' \
+    '    movq 112(%rdi), %rsi' \
+    '    movq 160(%rdi), %rsp' \
+    '    movq 168(%rdi), %rax' \
+    '    pushq %rax' \
+    '    movq 104(%rdi), %rdi' \
+    '    xorl %eax, %eax' \
+    '    ret' \
+    '.global swapcontext' \
+    'swapcontext:' \
+    '    movq %rbx, 128(%rdi)' \
+    '    movq %rbp, 120(%rdi)' \
+    '    movq %r12, 72(%rdi)' \
+    '    movq %r13, 80(%rdi)' \
+    '    movq %r14, 88(%rdi)' \
+    '    movq %r15, 96(%rdi)' \
+    '    movq (%rsp), %rax' \
+    '    movq %rax, 168(%rdi)' \
+    '    leaq 8(%rsp), %rax' \
+    '    movq %rax, 160(%rdi)' \
+    '    movq 128(%rsi), %rbx' \
+    '    movq 120(%rsi), %rbp' \
+    '    movq 72(%rsi), %r12' \
+    '    movq 80(%rsi), %r13' \
+    '    movq 88(%rsi), %r14' \
+    '    movq 96(%rsi), %r15' \
+    '    movq 40(%rsi), %r8' \
+    '    movq 48(%rsi), %r9' \
+    '    movq 136(%rsi), %rdx' \
+    '    movq 152(%rsi), %rcx' \
+    '    movq 160(%rsi), %rsp' \
+    '    movq 168(%rsi), %rax' \
+    '    pushq %rax' \
+    '    movq 104(%rsi), %rdi' \
+    '    movq 112(%rsi), %rsi' \
+    '    xorl %eax, %eax' \
+    '    ret' > "$TMP_DIR/compat.s"
+
+    printf '%s\n' \
+    '#include <ucontext.h>' \
+    '#include <stdarg.h>' \
+    '#include <stdint.h>' \
+    '#include <unistd.h>' \
+    '#include <sys/random.h>' \
+    'void arc4random_buf(void *buf, size_t n) {' \
+    '    unsigned char *p = (unsigned char *)buf;' \
+    '    while (n > 0) {' \
+    '        ssize_t r = getrandom(p, n, 0);' \
+    '        if (r > 0) { p += r; n -= (size_t)r; } else { break; }' \
+    '    }' \
+    '}' \
+    'static void __coroutine_exit(void) { _exit(0); }' \
+    'void makecontext(ucontext_t *ucp, void (*func)(void), int argc, ...) {' \
+    '    uintptr_t *sp = (uintptr_t *)((uintptr_t)ucp->uc_stack.ss_sp + ucp->uc_stack.ss_size);' \
+    '    sp = (uintptr_t *)((uintptr_t)sp & -16L);' \
+    '    *--sp = (uintptr_t)__coroutine_exit;' \
+    '    ucp->uc_mcontext.gregs[15] = (uintptr_t)sp;' \
+    '    ucp->uc_mcontext.gregs[16] = (uintptr_t)func;' \
+    '    if (argc > 0) {' \
+    '        va_list ap; va_start(ap, argc);' \
+    '        ucp->uc_mcontext.gregs[8] = va_arg(ap, uintptr_t);' \
+    '        if (argc > 1) ucp->uc_mcontext.gregs[9]  = va_arg(ap, uintptr_t);' \
+    '        if (argc > 2) ucp->uc_mcontext.gregs[12] = va_arg(ap, uintptr_t);' \
+    '        if (argc > 3) ucp->uc_mcontext.gregs[14] = va_arg(ap, uintptr_t);' \
+    '        if (argc > 4) ucp->uc_mcontext.gregs[0]  = va_arg(ap, uintptr_t);' \
+    '        if (argc > 5) ucp->uc_mcontext.gregs[1]  = va_arg(ap, uintptr_t);' \
+    '        va_end(ap);' \
+    '    }' \
+    '}' > "$TMP_DIR/compat.c"
+
+    printf '%s\n' \
+    'ENTRY(_start)' \
+    'PHDRS {' \
+    '    text PT_LOAD FILEHDR PHDRS FLAGS(5);' \
+    '    data PT_LOAD FLAGS(6);' \
+    '    stack PT_GNU_STACK FLAGS(6);' \
+    '}' \
+    'SECTIONS {' \
+    '    . = 0x400000 + SIZEOF_HEADERS;' \
+    '    .text : {' \
+    '        KEEP(*crt1.o(.text))' \
+    '        *(.text*)' \
+    '        KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*) SORT_BY_INIT_PRIORITY(.ctors.*)))' \
+    '        KEEP(*(.init_array* .ctors*))' \
+    '        KEEP(*(.init))' \
+    '        KEEP(*(.fini))' \
+    '    } :text' \
+    '    .rodata : { *(.rodata*) } :text' \
+    '    . = ALIGN(0x1000);' \
+    '    .data : { *(.data*) } :data' \
+    '    .bss  : { *(.bss*) *(COMMON) } :data' \
+    '    /DISCARD/ : {' \
+    '        *(.note.*)' \
+    '        *(.comment)' \
+    '        *(.eh_frame*)' \
+    '    }' \
+    '}' > "$LINK_SCRIPT"
+
+    as "$TMP_DIR/compat.s" -o "$TMP_DIR/compat_asm.o"
+
+    local ALL_SRCS=()
+    for f in "$RUNTIME_DIR"/scr_*.c; do
+        if [[ ! "$f" =~ _island\.c$ ]] && [ -f "$f" ]; then
+            ALL_SRCS+=("$f")
+        fi
+    done
+
+    # QuickJS RegExp
+    [ -f "$VENDOR_DIR/quickjs-ng/libregexp.c" ] && ALL_SRCS+=("$VENDOR_DIR/quickjs-ng/libregexp.c" "$VENDOR_DIR/quickjs-ng/libunicode.c")
+    # zlib
+    for f in "$VENDOR_DIR"/zlib/*.c; do [ -f "$f" ] && ALL_SRCS+=("$f"); done
+    # mbedtls
+    for f in "$VENDOR_DIR"/mbedtls/library/*.c; do [ -f "$f" ] && ALL_SRCS+=("$f"); done
+
+    gcc -Os -nostdinc -D_GNU_SOURCE \
+        -Wno-implicit-function-declaration \
+        -Wno-int-conversion \
+        -Wno-incompatible-pointer-types \
+        -isystem "$MUSL_PATH/include" \
+        -I "$RUNTIME_DIR" \
+        -I "$VENDOR_DIR/quickjs-ng" \
+        -I "$VENDOR_DIR/zlib" \
+        -I "$VENDOR_DIR/mbedtls/include" \
+        -ffunction-sections -fdata-sections \
+        -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-stack-protector \
+        -c "$TMP_DIR/compat.c" "${ALL_SRCS[@]}"
+
+    mv *.o "$TMP_DIR/" 2>/dev/null || true
+    ar rcs "$STATIC_LIB" "$TMP_DIR"/*.o
+    rm -rf "$TMP_DIR"
+    echo "✅ [Cache] Full runtime cache ready (Regex, zlib & mbedTLS compiled)!"
+}
+
+if [ "$FORCE_RECACHE" -eq 1 ] || [ ! -f "$STATIC_LIB" ] || [ ! -f "$LINK_SCRIPT" ]; then
+    rebuild_cache
+    if [ -z "$INPUT" ]; then
+        exit 0
+    fi
+fi
+
+BASENAME="$(basename "$INPUT")"
+BASENAME="${BASENAME%.*}"
+[ -z "$OUTPUT" ] && OUTPUT="$BASENAME"
+
+BUILD_DIR="$(mktemp -d /tmp/jsib_user_XXXXXX)"
+cleanup() {
+    if [ "$KEEP" -eq 0 ]; then
+        rm -rf "$BUILD_DIR"
+        rm -rf .scriptc
+    else
+        echo "📂 Artifacts kept in: $BUILD_DIR"
+    fi
+}
+trap cleanup EXIT
+
+echo "⚡ [1/3] Transpiling $INPUT..."
+scriptc build "$INPUT" --backend c --emit-ir >/dev/null 2>&1
+
+C_FILE=""
+if [ -f ".scriptc/$BASENAME.c" ]; then
+    C_FILE=".scriptc/$BASENAME.c"
+else
+    C_FILE="$(find .scriptc -name "*.c" 2>/dev/null | head -n1)"
+fi
+
+if [ -z "$C_FILE" ] || [ ! -f "$C_FILE" ]; then
+    echo "❌ Failed to generate C file from scriptc."
+    exit 1
+fi
+
+echo "🔨 [2/3] Compiling $BASENAME.c..."
+gcc -Os -nostdinc -D_GNU_SOURCE \
+    -Wno-implicit-function-declaration \
+    -Wno-int-conversion \
+    -Wno-incompatible-pointer-types \
+    -isystem "$MUSL_PATH/include" \
+    -I "$RUNTIME_DIR" \
+    -I "$VENDOR_DIR/quickjs-ng" \
+    -I "$VENDOR_DIR/zlib" \
+    -I "$VENDOR_DIR/mbedtls/include" \
+    -ffunction-sections -fdata-sections \
+    -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-stack-protector \
+    -c "$C_FILE" -o "$BUILD_DIR/app.o"
+
+echo "📦 [3/3] Linking static binary with --gc-sections..."
+ld -m elf_x86_64 -static -T "$LINK_SCRIPT" --gc-sections -e _start \
+   -z noexecstack \
+   "$MUSL_PATH/lib/crt1.o" \
+   "$MUSL_PATH/lib/crti.o" \
+   "$BUILD_DIR/app.o" \
+   --whole-archive "$STATIC_LIB" --no-whole-archive \
+   --start-group \
+   "$MUSL_PATH/lib/libc.a" \
+   --end-group \
+   "$MUSL_PATH/lib/crtn.o" \
+   -o "$OUTPUT"
+
+if command -v sstrip >/dev/null 2>&1; then
+    sstrip "$OUTPUT" 2>/dev/null || true
+else
+    strip "$OUTPUT" 2>/dev/null || true
+fi
+
+echo "✅ Done!"
+ls -lh "$OUTPUT"
+echo "🚀 Standalone static executable ready: ./$OUTPUT"
