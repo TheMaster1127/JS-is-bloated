@@ -268,7 +268,7 @@ rebuild_cache() {
     # mbedtls
     for f in "$VENDOR_DIR"/mbedtls/library/*.c; do [ -f "$f" ] && ALL_SRCS+=("$f"); done
 
-    gcc -Os -nostdinc -D_GNU_SOURCE \
+    gcc -O3 -nostdinc -D_GNU_SOURCE \
         -Wno-implicit-function-declaration \
         -Wno-int-conversion \
         -Wno-incompatible-pointer-types \
@@ -325,7 +325,7 @@ if [ -z "$C_FILE" ] || [ ! -f "$C_FILE" ]; then
 fi
 
 echo "🔨 [2/3] Compiling $BASENAME.c..."
-gcc -Os -nostdinc -D_GNU_SOURCE \
+gcc -O3 -nostdinc -D_GNU_SOURCE \
     -Wno-implicit-function-declaration \
     -Wno-int-conversion \
     -Wno-incompatible-pointer-types \
@@ -353,8 +353,6 @@ ld -m elf_x86_64 -static -T "$LINK_SCRIPT" --gc-sections -e _start \
 
 if command -v sstrip >/dev/null 2>&1; then
     sstrip "$OUTPUT" 2>/dev/null || true
-else
-    strip "$OUTPUT" 2>/dev/null || true
 fi
 
 echo "✅ Done!"

@@ -52,7 +52,7 @@ Modern JavaScript deployment toolchains suffer from staggering bloat. When you w
 | **Bun compile** | Bundles JavaScriptCore VM + Zig runtime | **~60 MB – 90 MB** | ~25 – 40 ms |
 | **Deno compile** | Bundles V8 Engine + Rust runtime | **~75 MB – 100 MB** | ~35 – 50 ms |
 | **Docker container** | Full Linux userland just to run 1 JS file | **~150 MB – 400 MB** | ~500 – 1500 ms |
-| **jsib (Static ELF)** | **AOT C translation + Naked Musl + DCE** | **86 KB – 122 KB** | **0.30 ms (~302 µs)** |
+| **jsib (Static ELF)** | **AOT C translation + Naked Musl + DCE** | **92 KB – 122 KB** | **0.30 ms (~302 µs)** |
 
 For simple utilities, micro-services, system scripts, and background daemons, paying an **85-megabyte tax** for a loop that prints five lines of text is unacceptable.
 
